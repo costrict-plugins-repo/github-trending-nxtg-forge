@@ -1,0 +1,178 @@
+// scripts/feature-task.sh: the create step of /nxtg-forge:feature's orchestrator loop (alpha run 2,
+// F-H; path (b), shape B1). A stub `forge` records how it is called; the real binary is driven end to
+// end in tests/integration/l2-journey.mjs, leg F.
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const PLUGIN = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const SCRIPT = join(PLUGIN, 'scripts', 'feature-task.sh');
+const FEATURE_MD = join(PLUGIN, 'commands', 'feature.md');
+
+let root, home, stubDir, log;
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'forge-feat-'));
+  home = mkdtempSync(join(tmpdir(), 'forge-feat-home-'));
+  stubDir = mkdtempSync(join(tmpdir(), 'forge-feat-bin-'));
+  log = join(stubDir, 'calls.log');
+  // Records argv, and whether stdin was left open (the script must close it).
+  writeFileSync(join(stubDir, 'forge'),
+    // It identifies as NXTG forge, the only forge find-forge launches; --version is not logged as a call.
+    `#!/bin/bash\n[ "$1" = --version ] && { echo "forge 1.7.0"; exit 0; }\nprintf '%s\\n' "$*" >> "${log}"\n` +
+    `if read -r -t 1 line; then echo "stdin-open:$line" >> "${log}"; fi\n` +
+    `[ -n "$STUB_FAIL" ] && { echo "half-written" > .forge/plan.md; echo "boom from forge"; exit 7; }\n` +
+    // Like the real binary: plan --generate rewrites .forge/plan.md with only this run's tasks.
+    `printf '# Plan\\n\\n- T-NEW generated\\n' > .forge/plan.md\necho "Generated 1 tasks"\n`,
+    { mode: 0o755 });
+});
+afterEach(() => {
+  for (const d of [root, home, stubDir]) rmSync(d, { recursive: true, force: true });
+});
+
+function run(args, { withStub = true, env = {}, input = 'y\n', cwd = root, script = SCRIPT } = {}) {
+  const PATH = withStub ? `${stubDir}:/usr/bin:/bin` : '/usr/bin:/bin';
+  const r = spawnSync('bash', [script, ...args], {
+    cwd, input, encoding: 'utf8', timeout: 15000, env: { PATH, HOME: home, ...env },
+  });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, kv: Object.fromEntries(
+    r.stdout.split('\n').filter((l) => l.includes('=')).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)])) };
+}
+const calls = () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []);
+const initForge = () => mkdirSync(join(root, '.forge'));
+
+describe('feature-task.sh', () => {
+  it('runs plan --generate with --spec on a one-heading spec, stdin closed', () => {
+    initForge();
+    const r = run(['Add a usage example', 'Show naturalsize in the docstring.']);
+    expect(r.status).toBe(0);
+    expect(r.kv).toMatchObject({ status: 'created', title: 'Add a usage example', spec: '.forge/feature-requests/F-001.md' });
+    expect(calls()).toEqual([`plan --generate --spec .forge/feature-requests/F-001.md --project ${root}`]);
+    expect(readFileSync(join(root, r.kv.spec), 'utf8')).toBe('## Add a usage example\n\nShow naturalsize in the docstring.\n');
+  });
+
+  it('the spec always holds exactly one heading', () => {
+    initForge();
+    const r = run(['## Add\nexport', 'line one\n## Sneaky heading\nline three']);
+    expect(r.status).toBe(0);
+    const spec = readFileSync(join(root, r.kv.spec), 'utf8');
+    expect(spec.split('\n').filter((l) => /^#+ /.test(l))).toEqual(['## Add export']);
+  });
+
+  it('numbers specs F-001, F-002, … and never reuses one', () => {
+    initForge();
+    expect(run(['First', 'a']).kv.spec).toBe('.forge/feature-requests/F-001.md');
+    writeFileSync(join(root, '.forge', 'feature-requests', 'F-007.md'), '## Old\n\nx\n');
+    expect(run(['Second', 'b']).kv.spec).toBe('.forge/feature-requests/F-008.md');
+    expect(readdirSync(join(root, '.forge', 'feature-requests')).filter((f) => /^F-\d+\.md$/.test(f)).sort()).toEqual(['F-001.md', 'F-007.md', 'F-008.md']);
+  });
+
+  it('no .forge/ (forge init not run): exit 11, forge not called, nothing written', () => {
+    const r = run(['Feature', 'd']);
+    expect(r.status).toBe(11);
+    expect(r.kv.status).toBe('no-forge-dir');
+    expect(calls()).toEqual([]);
+    expect(existsSync(join(root, '.forge'))).toBe(false);
+  });
+
+  it('run from a subdirectory (the model ran `cd src`): it finds the .forge/ of the project and creates the task there', () => {
+    initForge();
+    mkdirSync(join(root, 'src', 'pkg'), { recursive: true });
+    const r = run(['From src', 'd'], { cwd: join(root, 'src', 'pkg') });
+    expect(r.status).toBe(0);
+    expect(r.kv).toMatchObject({ status: 'created', project: root, spec: '.forge/feature-requests/F-001.md' });
+    expect(calls()).toEqual([`plan --generate --spec .forge/feature-requests/F-001.md --project ${root}`]);
+    expect(existsSync(join(root, '.forge', 'feature-requests', 'F-001.md'))).toBe(true);
+    expect(existsSync(join(root, 'src', 'pkg', '.forge'))).toBe(false);
+  });
+
+  it('CLAUDE_PROJECT_DIR with a .forge/ wins over the shell cwd', () => {
+    initForge();
+    const elsewhere = mkdtempSync(join(tmpdir(), 'forge-feat-cwd-'));
+    try {
+      const r = run(['Via env', 'd'], { cwd: elsewhere, env: { CLAUDE_PROJECT_DIR: root } });
+      expect(r.kv).toMatchObject({ status: 'created', project: root });
+    } finally { rmSync(elsewhere, { recursive: true, force: true }); }
+  });
+
+  it('mutant: no walk up from the cwd turns the subdirectory check red', () => {
+    initForge();
+    mkdirSync(join(root, 'src'), { recursive: true });
+    const src = readFileSync(SCRIPT, 'utf8');
+    const from = '    d="$(dirname "$d")"\n';
+    expect(src.split(from).length - 1).toBe(1);
+    const m = join(PLUGIN, 'scripts', `.mutant-${process.pid}-feature-task.sh`);
+    writeFileSync(m, src.replace(from, '    return 1\n'));
+    try {
+      expect(run(['From src', 'd'], { cwd: join(root, 'src'), script: m }).kv.status).toBe('no-forge-dir');
+    } finally { rmSync(m, { force: true }); }
+  });
+
+  it('no forge installed: exit 10', () => {
+    initForge();
+    const r = run(['Feature', 'd'], { withStub: false });
+    expect(r.status).toBe(10);
+    expect(r.kv.status).toBe('no-forge');
+  });
+
+  it('forge failing is an error with its output on stderr', () => {
+    initForge();
+    const r = run(['Feature', 'd'], { env: { STUB_FAIL: '1' } });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('boom from forge');
+    expect(r.kv.status).toBeUndefined();
+  });
+
+  it('an existing plan.md is kept, with the new plan appended and a backup beside the spec', () => {
+    initForge();
+    const before = '# My plan\n\n## Milestone 1\n- T-001 my own task\n';
+    writeFileSync(join(root, '.forge', 'plan.md'), before);
+    const r = run(['Feature', 'd']);
+    expect(r.status).toBe(0);
+    expect(r.kv.plan_backup).toBe('.forge/feature-requests/F-001.plan-before.md');
+    expect(readFileSync(join(root, r.kv.plan_backup), 'utf8')).toBe(before);
+    const after = readFileSync(join(root, '.forge', 'plan.md'), 'utf8');
+    expect(after.startsWith(before)).toBe(true);
+    expect(after).toContain('- T-NEW generated');
+    expect(after).toContain('Added by /nxtg-forge:feature (.forge/feature-requests/F-001.md)');
+    // The backup is not mistaken for a spec when numbering the next one.
+    expect(run(['Second', 'd']).kv.spec).toBe('.forge/feature-requests/F-002.md');
+  });
+
+  it('no plan.md before: forge\'s plan stands, and there is no backup', () => {
+    initForge();
+    const r = run(['Feature', 'd']);
+    expect(r.kv.plan_backup).toBeUndefined();
+    expect(readFileSync(join(root, '.forge', 'plan.md'), 'utf8')).toBe('# Plan\n\n- T-NEW generated\n');
+  });
+
+  it('forge failing leaves the earlier plan.md exactly as it was', () => {
+    initForge();
+    writeFileSync(join(root, '.forge', 'plan.md'), '# Mine\n');
+    const r = run(['Feature', 'd'], { env: { STUB_FAIL: '1' } });
+    expect(r.status).toBe(1);
+    expect(readFileSync(join(root, '.forge', 'plan.md'), 'utf8')).toBe('# Mine\n');
+  });
+
+  it('an empty title is a usage error', () => {
+    initForge();
+    expect(run(['  ## ', 'd']).status).toBe(2);
+    expect(calls()).toEqual([]);
+  });
+});
+
+describe('no path runs a bare `plan --generate`', () => {
+  const bare = (text) => text.split('\n')
+    .filter((l) => /plan\s+(--generate|-g)\b/.test(l) && !/^\s*#/.test(l))
+    .filter((l) => !/--spec\b/.test(l));
+  it('feature-task.sh', () => {
+    expect(bare(readFileSync(SCRIPT, 'utf8'))).toEqual([]);
+  });
+  it('commands/feature.md', () => {
+    const md = readFileSync(FEATURE_MD, 'utf8');
+    expect(bare(md).filter((l) => !/Never run/.test(l) && !/rewrites `\.forge\/plan\.md`/.test(l))).toEqual([]);
+    expect(md).toContain('${CLAUDE_PLUGIN_ROOT}/scripts/feature-task.sh');
+  });
+});
