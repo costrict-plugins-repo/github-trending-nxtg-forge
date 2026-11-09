@@ -1,0 +1,180 @@
+---
+description: "Enhanced status with detailed dashboard and metrics"
+disable-model-invocation: true
+allowed-tools: Bash(node:*)
+---
+
+# NXTG-Forge Enhanced Status Dashboard
+
+You are the **Dashboard Reporter** - show a comprehensive, detailed project dashboard with metrics and recommendations.
+
+This is the enhanced version of `/nxtg-forge:status` with deeper analysis.
+
+## Data Gathering
+
+Gather ALL data using native tools in parallel:
+
+### 1. Complete Git Analysis
+```bash
+# Branch info
+git branch --show-current
+git log --oneline -20
+git shortlog -sn --since="30 days ago" 2>/dev/null
+
+# Change stats
+git diff --stat main...HEAD 2>/dev/null
+git diff --shortstat HEAD~10..HEAD 2>/dev/null
+
+# Activity heatmap (commits per day last 7 days)
+for i in $(seq 0 6); do
+  date_str=$(date -d "$i days ago" +%Y-%m-%d 2>/dev/null || date -v-${i}d +%Y-%m-%d)
+  count=$(git log --oneline --after="$date_str 00:00" --before="$date_str 23:59" 2>/dev/null | wc -l)
+  echo "$date_str: $count"
+done
+```
+
+### 2. Full Test Analysis
+```bash
+npx vitest run --reporter=verbose 2>&1
+```
+
+### 3. TypeScript Health
+```bash
+npx tsc --noEmit 2>&1 | tail -20
+```
+
+### 4. Security
+```bash
+npm audit --json 2>/dev/null | head -50
+```
+
+### 5. Code Metrics
+```bash
+# Total lines of code
+find src -name "*.ts" -not -name "*.test.ts" -not -path "*/__tests__/*" | xargs wc -l 2>/dev/null | tail -1
+
+# File count
+find src -name "*.ts" -not -name "*.test.ts" -not -path "*/__tests__/*" | wc -l
+
+# Test file count
+find src -name "*.test.ts" -o -name "*.spec.ts" | wc -l
+
+# Type safety
+grep -rn "as any" src/ --include="*.ts" | grep -v test | grep -v __tests__ | wc -l
+```
+
+### 6. Governance & Agents
+
+Read `.claude/governance.json` for governance state, or `.forge/governance.json` when only `forge init` has run. Either file means governance is initialized.
+
+Agents and commands are loaded from the NXTG-Forge plugin. Count them in the installed plugin with this command, and use its numbers for `{agent_count}` and `{command_count}`; never a number written here. No need to check `.claude/agents/` or `.claude/commands/` directories.
+
+```bash
+R="${CLAUDE_PLUGIN_ROOT}"; n() { wc -l | tr -d ' '; }
+echo "agents=$(ls "$R"/agents/*.md 2>/dev/null | n) commands=$(ls "$R"/commands/*.md 2>/dev/null | n) skills=$(ls "$R"/skills/*/SKILL.md 2>/dev/null | n) hooks=$(grep -o 'scripts/[A-Za-z0-9_.-]*\.sh' "$R/hooks/hooks.json" 2>/dev/null | sort -u | n) registrations=$(grep -o '"command"[[:space:]]*:' "$R/hooks/hooks.json" 2>/dev/null | n)"
+```
+
+### 6b. Orchestrator Data
+
+The orchestrator's state is computed by code, not judged from tool results. This step already ran:
+
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/orchestrator-status.mjs"`
+
+Print its `line=` text exactly as given as the first line of the ORCHESTRATOR block, and do not decide the state yourself. **If the output above is empty or has no `line=` (the step did not run), print exactly `◌ **Orchestrator status unavailable** — the status step did not run` instead. Never decide the state from tool results instead.** Only when it says `orchestrator=connected`, call these orchestrator MCP tools in parallel for the rest of the block:
+- `forge_get_state` — Full orchestration state
+- `forge_get_tasks` — Task board with statuses
+- `forge_get_health` — Orchestrator health check (docs, architecture, task health, knowledge coverage, drift). L2 only.
+- `forge_get_knowledge` — Knowledge base entries
+- `forge_check_drift` — Vision alignment
+
+For any other `orchestrator=` value, the computed line is the whole ORCHESTRATOR block. The Health Score above is computed locally and does not depend on the orchestrator; the plugin's `forge_get_governance_health` remains available as an L1 health source.
+
+### 7. Dependencies
+```bash
+npm outdated 2>/dev/null | head -20
+jq '.dependencies | length' package.json 2>/dev/null
+jq '.devDependencies | length' package.json 2>/dev/null
+```
+
+## Display Enhanced Dashboard
+
+```
+NXTG-FORGE PROJECT DASHBOARD
+===============================
+Generated: {timestamp}
+
+PROJECT
+  Name: {name} v{version}
+  Branch: {branch} ({commit_hash})
+  Lines of code: {loc} across {file_count} files
+
+HEALTH SCORE: {calculated_score}/100
+  Tests:    {test_score}/25  ({pass_count}/{total_count} passing)
+  Types:    {type_score}/25  ({error_count} TS errors, {any_count} 'as any')
+  Security: {sec_score}/25   ({vuln_count} vulnerabilities)
+  Quality:  {qual_score}/25  ({console_count} console.logs, {todo_count} TODOs)
+
+GIT ACTIVITY (last 7 days)
+  Commits: {total_commits}
+  {commit_heatmap_visualization}
+
+  Recent:
+    {hash} {message} ({time})
+    {hash} {message} ({time})
+    {hash} {message} ({time})
+
+TESTS
+  Suites: {suite_count}
+  Tests:  {pass}/{total} passing ({duration})
+  Coverage: {file_coverage}% file coverage
+
+TYPESCRIPT
+  Errors: {error_count}
+  Warnings: {warning_count}
+  Status: {CLEAN / {error_count} errors}
+
+SECURITY
+  Vulnerabilities: {critical} critical, {high} high, {moderate} moderate
+  Dependencies: {dep_count} prod, {dev_dep_count} dev
+  Outdated: {outdated_count}
+
+GOVERNANCE
+  Status: {status}
+  Workstreams: {active}/{total}
+  Agents: {agent_count} available
+  Commands: {command_count} available
+
+ORCHESTRATOR
+  {computed line= text, exactly}
+  Project: {project_name} | Version: {version}
+  Tasks: {pending} pending, {in_progress} active, {completed} done
+  File locks: {active_locks}
+  Knowledge: {knowledge_count} entries
+  Health: {orchestrator_health_summary}
+  Drift: {aligned/drifting}
+
+RECOMMENDATIONS
+  1. {based on lowest score dimension}
+  2. {based on second lowest}
+  3. {based on third lowest}
+
+---
+Quick Actions:
+  /nxtg-forge:test          Run tests
+  /nxtg-forge:gap-analysis  Deep analysis
+  /nxtg-forge:optimize      Optimization scan
+  /nxtg-forge:report        Activity report
+```
+
+## Health Score Calculation
+
+Calculate a 0-100 score:
+- **Tests (25 pts)**: 25 * (passing / total). 0 if no tests.
+- **Types (25 pts)**: 25 if 0 TS errors, -5 per error, -1 per 'as any'. Min 0.
+- **Security (25 pts)**: 25 - (critical*10 + high*5 + moderate*2). Min 0.
+- **Quality (25 pts)**: 25 - (console.logs + TODOs/5). Min 0.
+
+## Error Handling
+
+If any data source fails, show "N/A" and continue with available data.
+Always calculate the health score from available dimensions.

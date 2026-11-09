@@ -1,0 +1,10 @@
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+plugins/nxtg-forge/servers/governance-mcp/coverage/
+.asif/
+.claude/settings.json
+tools/shipped-wrong-detector/audits/
