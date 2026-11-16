@@ -1,0 +1,78 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { execSync } from 'child_process';
+import { getGitStatus } from '../tools.mjs';
+import { setupFixture, teardownFixture, getFixturePath } from './setup.mjs';
+
+beforeAll(setupFixture);
+afterAll(teardownFixture);
+
+describe('getGitStatus', () => {
+  it('returns correct branch name and recent commits', () => {
+    const root = getFixturePath();
+    const result = getGitStatus(root);
+
+    // git init creates 'master' or 'main' depending on git config
+    expect(result.branch).toMatch(/\S+/);
+    expect(result.branch.length).toBeGreaterThan(0);
+
+    // Fixture has at least 1 commit
+    expect(result.commitCount).toBeGreaterThanOrEqual(1);
+    expect(result.lastCommit).toMatch(/^[a-f0-9]{7,}/);
+  });
+
+  it('clean working tree is reported as clean:true', () => {
+    const root = getFixturePath();
+    const result = getGitStatus(root);
+
+    // After setupFixture commits everything, tree should be clean
+    expect(result.clean).toBe(true);
+    expect(result.modified).toBe(0);
+    expect(result.untracked).toBe(0);
+  });
+
+  it('untracked file is detected as dirty state', () => {
+    const root = getFixturePath();
+
+    // Create an untracked file
+    writeFileSync(join(root, 'untracked-temp.txt'), 'dirty state test');
+
+    const result = getGitStatus(root);
+
+    expect(result.clean).toBe(false);
+    expect(result.untracked).toBeGreaterThanOrEqual(1);
+
+    // Cleanup by removing the file to restore clean state for other tests
+    import('fs').then(({ unlinkSync }) => {
+      try { unlinkSync(join(root, 'untracked-temp.txt')); } catch {}
+    });
+  });
+
+  it('finds .git in subdirectory when root has no .git (Bug B)', () => {
+    // Create parent dir without .git, child dir with .git
+    const parent = mkdtempSync(join(tmpdir(), 'forge-gitroot-'));
+    const child = join(parent, 'myapp');
+    mkdirSync(child, { recursive: true });
+
+    // Init git in child, create a commit
+    execSync('git init', { cwd: child, stdio: 'pipe' });
+    execSync('git config user.email "test@forge.test"', { cwd: child, stdio: 'pipe' });
+    execSync('git config user.name "Forge Test"', { cwd: child, stdio: 'pipe' });
+    writeFileSync(join(child, 'package.json'), '{"name":"subdir-app"}');
+    execSync('git add .', { cwd: child, stdio: 'pipe' });
+    execSync('git commit -m "init subdir project"', { cwd: child, stdio: 'pipe' });
+
+    // Call getGitStatus with PARENT dir (no .git there) — should find child's .git
+    const result = getGitStatus(parent);
+
+    expect(result.commitCount).toBeGreaterThanOrEqual(1);
+    expect(result.lastCommit).toMatch(/init subdir project/);
+    expect(result.branch).toMatch(/\S+/);
+    expect(result.branch.length).toBeGreaterThan(0);
+
+    // Cleanup
+    rmSync(parent, { recursive: true, force: true });
+  });
+});
