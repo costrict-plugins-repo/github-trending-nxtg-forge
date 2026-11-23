@@ -1,0 +1,455 @@
+#!/usr/bin/env node
+// L3 integration harness (DIRECTIVE-NXTG-20260718-13, G-09 phase 3 of 3) — the "Ship Lord" journey.
+//
+// Snaps ALL THREE products together against ONE clean temp fixture: the plugin governance/orchestrator
+// MCP (Rust `forge mcp`) AND forge-ui's API+WS server, with the real pinned forge binary. Exercises the
+// cross-product contract dx-journeys requires (UI health == orchestrator forge_get_health) and a live
+// WebSocket round-trip. forge-ui is a TEST-FIXTURE DEP: booted from its repo, never modified.
+//
+// Standalone entrypoint: `node tests/integration/l3-journey.mjs` (exit 0/1); also the L3 leg of
+// `npm test`. No new runtime deps (HTTP via global fetch; WS via forge-ui's own `ws`, see below), no
+// tool-impl changes, only the temp fixture is ever mutated.
+//
+// Grounded on live forge-ui probes + the forge-ui convergence spec (al:4caf3e520f6fb9d3) + identity
+// fix e8c011f — every assertion below was confirmed against the real servers before it was written:
+//  * forge-ui's BUILT server is broken (ERR_MODULE_NOT_FOUND) → boot the SOURCE via the tsx loader.
+//  * projectRoot = process.cwd() → bind by launching with cwd=fixture (data.project.path == fixture).
+//  * `node --import <tsxLoader> api-server.ts` is a SINGLE process → clean teardown; a CONCURRENT
+//    forge-ui session may be live on this box, so teardown is scoped to OUR child pid ONLY — never
+//    pkill-by-name (that would kill another session's server).
+//  * Rust forge_get_health.health_score is a FLOAT; forge-ui serves a ROUNDED int → assert Math.round.
+//  * forge-ui WS allows a MISSING Origin (api-server.ts:146 only blocks a present-unauthorized origin)
+//    → a valid ?token= ws-token plus, since v3.4.1, the access token in the upgrade header.
+//  * v3.4.1 auth (GHSA-rc7c-r55p-923j, contract dx-journeys L3 Step 1b): every /api route needs the
+//    per-install token. The harness authenticates as a local client per forge-ui
+//    docs/api/LOCAL-CLIENT-AUTH.md §3 "You spawn the server", and Leg A0 proves a client without it is refused.
+//
+// Regate-11 lessons carried forward: execute the .mcp.json ENV contract verbatim (bindOrchestrator),
+// outer-scope fixture registration (cleanup even on setup throw), task-scoped event assertions.
+//
+// Requires: forge at FORGE_PIN (tests/lib/checks.mjs) on PATH + a forge-ui checkout (FORGE_UI_DIR or the sibling repo). Both absent
+// = deterministic NAMED failures (FORGE_ABSENT / WRONG_BINARY_VERSION / UI_ABSENT), never silent skip.
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
+import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
+import {
+  FORGE_PIN, checkBinaryVersion, checkShapedResponse, checkHealthContract, checkUiIdentity, checkWsRoundtrip,
+  checkGovernanceContract,
+} from "../lib/checks.mjs";
+
+// Non-empty sentinels for EVERY field the governance.json contract names (regate-15): forge-ui's
+// migration must round-trip ALL of them, not just project.name. Values are free of "orchestrator" so
+// leg C's ref-check cannot false-positive on governance state echoed into a payload.
+const GOV_SENTINEL = {
+  version: "3.0.0-l3-sentinel",
+  project: { name: "l3-fixture", vision: "l3 contract sentinel vision", goals: ["l3-goal-sentinel"] },
+  workstreams: [{ id: "ws-sentinel", name: "l3 sentinel workstream" }],
+  qualityGates: { "l3-gate-sentinel": true },
+  metrics: { "l3-metric-sentinel": 42 },
+};
+
+const SERVER_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", ".."); // -> governance-mcp/
+// orchestrator-mcp is registered by the companion plugin since DIRECTIVE-NXTG-20261014-12.
+const COMPANION_ROOT = join(SERVER_DIR, "..", "..", "..", "nxtg-forge-orchestrator");
+const PKG = JSON.parse(readFileSync(join(SERVER_DIR, "package.json"), "utf8")); // governance-mcp version
+// forge-ui repo: env override, else the sibling checkout (…/NXTG-Forge/forge-ui). CI must provide one.
+const FORGE_UI_DIR = process.env.FORGE_UI_DIR || join(SERVER_DIR, "..", "..", "..", "..", "..", "forge-ui");
+
+let passed = 0;
+const failures = [];
+const findings = []; // named product findings (recorded, not harness bugs) surfaced in the summary
+function check(label, ok, detail = "") {
+  label = redact(label); detail = redact(detail);
+  if (ok) { passed++; console.log(`  ✓ ${label}`); }
+  else { failures.push(`${label}${detail ? ` — ${detail}` : ""}`); console.log(`  ✗ ${label}${detail ? ` — ${detail}` : ""}`); }
+}
+function recordFinding(name, detail) { findings.push(`${name}: ${redact(detail)}`); }
+
+const expandPlaceholders = (s, fixture) =>
+  s.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, join(SERVER_DIR, "..", "..")).replace(/\$\{CLAUDE_PROJECT_DIR\}/g, fixture);
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.on("error", reject);
+    s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)); });
+  });
+}
+
+function forgeVersion() {
+  try {
+    const out = execFileSync("forge", ["--version"], { encoding: "utf8", timeout: 10000 }).trim();
+    const m = out.match(/(\d+\.\d+\.\d+)/);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+// Alloc temp fixture dir, run populate, return path on success; on ANY throw remove the dir + rethrow
+// (regate-11 C2: no leak on setup failure). CANONICAL forge fixture — identity lives in
+// .forge/state.json:project_name; forge-ui e8c011f sources data.project.name from there.
+function makeFixtureWith(populate) {
+  const dir = mkdtempSync(join(tmpdir(), "forge-l3-fixture-"));
+  try { populate(dir); return dir; }
+  catch (e) { rmSync(dir, { recursive: true, force: true }); throw e; }
+}
+function populateFixture(dir) {
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "l3-fixture", version: "0.0.1" }, null, 2));
+  mkdirSync(join(dir, "src"));
+  writeFileSync(join(dir, "src", "index.ts"), "export const hello = () => 'hi';\n");
+  writeFileSync(join(dir, "SPEC.md"),
+    "# SPEC\n\n## Vision\nA clean fixture for the plugin L3 integration harness.\n\n" +
+    "## Requirements\n- Build a hello function\n- Add a test for it\n");
+  mkdirSync(join(dir, ".claude"));
+  const fenv = { ...process.env, FORGE_PROJECT_ROOT: dir };
+  execFileSync("forge", ["init", "-n", "l3-fixture", "--project", dir], { cwd: dir, env: fenv, stdio: "ignore", timeout: 30000 });
+  execFileSync("forge", ["config", "brain", "rule-based", "--project", dir], { cwd: dir, env: fenv, stdio: "ignore", timeout: 30000 });
+  execFileSync("forge", ["plan", "--generate", "--project", dir], { cwd: dir, env: fenv, stdio: "ignore", timeout: 60000 });
+  // Seed the full-contract sentinels LAST — `forge init` rewrites .claude/governance.json, so writing it
+  // after init guarantees forge-ui's migration operates on the pristine sentinel (regate-15).
+  writeFileSync(join(dir, ".claude", "governance.json"), JSON.stringify(GOV_SENTINEL, null, 2));
+}
+
+const canonicalProjectName = (fixture) => JSON.parse(readFileSync(join(fixture, ".forge", "state.json"), "utf8")).project_name;
+
+// Boot an MCP server from its .mcp.json spec, EXECUTING the env contract verbatim (regate-11 C1),
+// bound to the fixture. Used for BOTH governance-mcp (the plugin's own Node product — start.sh) and
+// orchestrator-mcp (Rust `forge mcp`), so the L3 topology has all THREE products concurrently live
+// (regate-13 C1: the earlier build never started governance-mcp).
+function bindMcpServer(key, fixture) {
+  const root = key === "orchestrator-mcp" ? COMPANION_ROOT : join(SERVER_DIR, "..", "..");
+  const spec = JSON.parse(readFileSync(join(root, ".mcp.json"), "utf8")).mcpServers[key];
+  const env = {};
+  for (const [k, v] of Object.entries(spec.env || {})) env[k] = expandPlaceholders(v, fixture);
+  env.PATH = process.env.PATH;
+  const args = (spec.args || []).map((a) => expandPlaceholders(a.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, root), fixture));
+  const cwd = env.FORGE_PROJECT_ROOT || fixture;
+  return new StdioClientTransport({ command: spec.command, args, env, cwd, stderr: "ignore" });
+}
+
+const textOf = (result) => (result.content || []).filter((c) => c?.type === "text").map((c) => c.text).join("\n");
+
+// Spawn forge-ui's API+WS server (SOURCE via tsx loader) bound to the fixture on an ephemeral port.
+// Returns { child, base } where base is the http origin. Single detached process → group-killable.
+// HOME is redirected to a throwaway dir so forge-ui's global runspace bookkeeping (`~/.forge/projects.json`
+// lastSync — os.homedir()-based) lands there, NOT the operator's real ~/.forge. Its inherited forge
+// subprocess (orchestrator-health) inherits this HOME too, so ALL of forge-ui's global writes are isolated.
+function bootForgeUi(fixture, port, home, token) {
+  const tsxLoader = join(FORGE_UI_DIR, "node_modules", "tsx", "dist", "loader.mjs");
+  const entry = join(FORGE_UI_DIR, "src", "server", "api-server.ts");
+  const child = spawn("node", ["--import", tsxLoader, entry], {
+    cwd: fixture,
+    // forge-ui v3.4.1+ local-client path (forge-ui docs/api/LOCAL-CLIENT-AUTH.md, "You spawn the server"):
+    // the token is generated in memory and passed only through the child's env, never argv, a file or a log.
+    // Passing it explicitly also keeps an inherited XDG_CONFIG_HOME from pointing at a real token file.
+    env: { ...process.env, HOME: home, FORGE_UI_SECRET: token, PORT: String(port), ALLOWED_ORIGINS: "http://localhost:5050", FORGE_BIN: process.env.FORGE_BIN || "forge" },
+    stdio: "ignore",
+    detached: true,
+  });
+  return { child, base: `http://127.0.0.1:${port}` };
+}
+
+// The local-client token for the forge-ui child this run spawns. In memory only: redact() scrubs it from
+// every line the harness prints, so it cannot reach a log or CI output even inside an error detail.
+let uiToken = null;
+const redact = (text) => (uiToken && typeof text === "string" ? text.split(uiToken).join("[REDACTED]") : text);
+
+// Ready = an AUTHENTICATED 200 on /api/health. Since v3.4.1 an unauthenticated probe answers 401, so
+// "something answered" would report a server ready that this client cannot actually use.
+async function waitForReady(base, child, ms = 30000) {
+  for (let i = 0; i < ms / 200; i++) {
+    if (child.exitCode !== null) return false; // child died during startup
+    try { const r = await uiFetch(base, "/api/health"); if (r.status === 200) return true; } catch { /* not up yet */ }
+    await new Promise((res) => setTimeout(res, 200));
+  }
+  return false;
+}
+
+// Every harness call to forge-ui's API goes through here, so the local-client credential
+// (DIRECTIVE-NXTG-20261007-12 item 2) is attached in exactly one place.
+function uiFetch(base, path, init = {}) {
+  return fetch(`${base}${path}`, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${uiToken}` } });
+}
+
+// Routes that return project data, so they must refuse a caller without the secret
+// (contract dx-journeys L3 Step 1b, GHSA-rc7c-r55p-923j): every /health route, plus the status route
+// leg B reads. The runspace id is a probe value; auth is checked before routing, so it never resolves.
+const PROTECTED_ROUTES = ["/api/health", "/api/workers/health", "/api/runspaces/l3-probe/health", "/api/forge/status"];
+const REFUSED = new Set([401, 403]);
+
+// Leg A0, the client-side half of Step 1b: a caller WITHOUT the secret is refused and learns nothing.
+// Raw fetch on purpose (never uiFetch), so this arm can never pick up the harness credential.
+async function assertUnauthenticatedRefused(base, fixture, canonical) {
+  const leaks = (body) => body.includes(fixture) || body.includes(canonical);
+  for (const route of PROTECTED_ROUTES) {
+    const r = await fetch(`${base}${route}`);
+    const body = await r.text();
+    check(`unauthenticated GET ${route} → refused (401/403), no project data`, REFUSED.has(r.status) && !leaks(body),
+      `got ${r.status}${leaks(body) ? ", body carries project data" : ""}`);
+  }
+  const wrong = await fetch(`${base}/api/health`, { headers: { Authorization: "Bearer l3-wrong-credential-not-the-secret" } });
+  const wrongBody = await wrong.text();
+  check("GET /api/health with a WRONG credential → refused (401/403), no project data",
+    REFUSED.has(wrong.status) && !leaks(wrongBody), `got ${wrong.status}`);
+  const foreign = await fetch(`${base}/api/health`, { headers: { Origin: "http://l3-foreign.invalid" } });
+  const foreignBody = await foreign.text();
+  check("GET /api/health from a foreign Origin → refused (401/403), no project data",
+    REFUSED.has(foreign.status) && !leaks(foreignBody), `got ${foreign.status}`);
+}
+
+// Reap the forge-ui child SCOPED TO ITS OWN PID (detached → its own process group). Never pkill-by-name.
+async function reap(child) {
+  if (!child || child.exitCode !== null) return;
+  try { process.kill(-child.pid, "SIGTERM"); } catch { try { child.kill("SIGTERM"); } catch { /* gone */ } }
+  for (let i = 0; i < 20; i++) { if (child.exitCode !== null) return; await new Promise((r) => setTimeout(r, 100)); }
+  try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch { /* gone */ } }
+}
+
+// A live WS round-trip: connect (token+missing-origin), collect message types, verify the connect
+// state.update binds to the fixture, and complete a ping→pong. Returns { events[], fixtureBound }.
+// The WS client comes from forge-ui's own node_modules (the fixture dep, like its tsx loader): since
+// v3.4.1 the /ws upgrade needs the access token in a header, which Node's global WebSocket cannot send
+// (forge-ui docs/api/LOCAL-CLIENT-AUTH.md §2). No new plugin dependency.
+const uiWsPath = () => join(FORGE_UI_DIR, "node_modules", "ws", "package.json");
+const loadUiWs = () => createRequire(uiWsPath())("ws");
+
+function wsRoundtrip(base, token, canonical) {
+  const UiWebSocket = loadUiWs();
+  return new Promise((resolve) => {
+    const events = [];
+    let fixtureBound = false;
+    const url = `${base.replace("http", "ws")}/ws?token=${token}`;
+    let ws;
+    const finish = () => { try { ws.close(); } catch { /* */ } resolve({ events, fixtureBound }); };
+    const timer = setTimeout(finish, 6000);
+    try { ws = new UiWebSocket(url, { headers: { Authorization: `Bearer ${uiToken}` } }); }
+    catch { clearTimeout(timer); return resolve({ events, fixtureBound }); }
+    ws.onopen = () => ws.send(JSON.stringify({ type: "ping" }));
+    ws.onerror = () => { clearTimeout(timer); finish(); };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      events.push(m.type);
+      if (m.type === "state.update") {
+        const blob = JSON.stringify(m.payload || {});
+        if (blob.includes(canonical)) fixtureBound = true; // fixture identity present in the state payload
+      }
+      if (m.type === "pong") { clearTimeout(timer); finish(); }
+    };
+  });
+}
+
+// The plugin's own skills tell users how to reach forge-ui under v3.4.1 auth. Leg D runs their bash
+// snippets VERBATIM (extracted from SKILL.md by a marker line), so the documented recipe and this
+// proof cannot drift apart.
+const SKILLS_DIR = join(SERVER_DIR, "..", "..", "skills");
+function skillSnippet(skill, marker) {
+  const md = readFileSync(join(SKILLS_DIR, skill, "SKILL.md"), "utf8").replace(/\r\n/g, "\n");
+  const block = [...md.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]).find((b) => b.includes(marker));
+  if (!block) throw new Error(`${skill}/SKILL.md: no bash block with marker "${marker}"`);
+  return block;
+}
+// Run a snippet as a user would, with a minimal env: the user's HOME, the API base, and the token
+// file. No XDG_CONFIG_HOME, so nothing can resolve to the operator's real token file.
+function runSnippet(snippet, { home, api, secretFile }) {
+  const r = spawnSync("bash", ["-c", snippet], {
+    env: { PATH: process.env.PATH, HOME: home, FORGE_UI_API: api, FORGE_UI_SECRET_FILE: secretFile },
+    encoding: "utf8", timeout: 20000,
+  });
+  return { code: r.status, out: `${r.stdout || ""}${r.stderr || ""}` };
+}
+
+async function uiStatus(base) {
+  const r = await uiFetch(base, "/api/forge/status");
+  const j = await r.json();
+  return j.data;
+}
+
+async function main() {
+  console.log("== L3 integration harness (Ship Lord journey) ==");
+
+  // ── Preconditions: pinned binary + forge-ui checkout. Fail-closed, named, no skip. ──
+  const bin = checkBinaryVersion(forgeVersion(), FORGE_PIN);
+  check(`forge binary on PATH == v${FORGE_PIN}`, bin.ok, bin.reason);
+  const uiPresent = existsSync(join(FORGE_UI_DIR, "src", "server", "api-server.ts")) &&
+    existsSync(join(FORGE_UI_DIR, "node_modules", "tsx", "dist", "loader.mjs")) && existsSync(uiWsPath());
+  check(`forge-ui checkout present (${FORGE_UI_DIR})`, uiPresent, uiPresent ? "" : "UI_ABSENT: set FORGE_UI_DIR or provide the sibling checkout with deps installed");
+  if (!bin.ok || !uiPresent) { summarize(); return; }
+
+  let fixture, uiHome, uiChild, orchClient, orchTransport, govClient, govTransport;
+  try {
+    fixture = makeFixtureWith(populateFixture);       // outer-scope registration (regate-11 C2)
+    uiHome = mkdtempSync(join(tmpdir(), "forge-l3-home-")); // isolates forge-ui's ~/.forge global writes
+    const canonical = canonicalProjectName(fixture);  // .forge/state.json project_name == "l3-fixture"
+    const port = await freePort();
+
+    // ── Leg A: Ship Lord snap — ALL THREE products live SIMULTANEOUSLY against one fixture ──
+    // regate-13 C1: the earlier build started orchestrator + forge-ui only; governance-mcp (the
+    // plugin's own Node product) was never executed. All three are now up concurrently below.
+    console.log("\n[Leg A] boot governance-mcp + orchestrator MCP + forge-ui API/WS (three products, one fixture)");
+    orchTransport = bindMcpServer("orchestrator-mcp", fixture);
+    orchClient = new Client({ name: "l3-orch", version: "1.0.0" }, { capabilities: {} });
+    await orchClient.connect(orchTransport);
+    const orchSv = orchClient.getServerVersion();
+    check(`orchestrator handshake version == ${FORGE_PIN}`, orchSv?.version === FORGE_PIN, `got ${orchSv?.version}`);
+
+    govTransport = bindMcpServer("governance-mcp", fixture); // Node server via start.sh — third product
+    govClient = new Client({ name: "l3-gov", version: "1.0.0" }, { capabilities: {} });
+    await govClient.connect(govTransport);
+    const govSv = govClient.getServerVersion();
+    check(`governance-mcp handshake version == package.json (${PKG.version})`, govSv?.version === PKG.version, `got ${govSv?.version}`);
+
+    uiToken = randomBytes(32).toString("hex");
+    const ui = bootForgeUi(fixture, port, uiHome, uiToken);
+    uiChild = ui.child;
+    const up = await waitForReady(ui.base, uiChild);
+    check(`forge-ui API up on ephemeral :${port} (authenticated /api/health → 200)`, up, up ? "" : "no authenticated 200 within 30s");
+    if (!up) throw new Error("forge-ui failed to boot");
+
+    console.log("\n[Leg A0] auth contract, client side: no secret → refused, nothing leaked (dx-journeys L3 Step 1b)");
+    await assertUnauthenticatedRefused(ui.base, fixture, canonical);
+
+    const healthResp = await uiFetch(ui.base, "/api/health").then((r) => r.json()).catch(() => ({}));
+    check("forge-ui /api/health status == healthy", healthResp.status === "healthy", `got ${healthResp.status}`);
+
+    // Cross-product interaction the three-live topology surfaces: forge-ui's startup migration rewrites the
+    // plugin's .claude/governance.json ({project:{name}} → {version,constitution}), dropping the identity
+    // governance-mcp reads (tools.mjs:123). A RELEASE GATE MUST NEVER REPAIR PRODUCT-OWNED STATE TO PASS —
+    // so we do NOT restore it. The governance identity check runs against the real post-boot file and FAILS
+    // HONESTLY; a red L3 is true state. The divergence is a real cross-product defect owned by forge-ui
+    // (DIRECTIVE-NXTG-20260719-18, Leg B — they round-trip the contract documented in
+    // docs/governance-mcp-governance-json-contract.md, convergence-spec style).
+    const govJsonPath = join(fixture, ".claude", "governance.json");
+    const afterBoot = JSON.parse(readFileSync(govJsonPath, "utf8"));
+
+    // With ALL THREE concurrently live, prove governance-mcp's fixture identity + health surface.
+    const govHealth = await govClient.callTool({ name: "forge_get_governance_health", arguments: {} });
+    const ghc = checkShapedResponse("forge_get_governance_health", govHealth);
+    check("governance-mcp forge_get_governance_health → shaped non-error (Node, all three live)", ghc.ok, ghc.reason);
+    const govState = await govClient.callTool({ name: "forge_get_governance_state", arguments: {} });
+    const gsc = checkShapedResponse("forge_get_governance_state", govState);
+    // Assert EVERYTHING the contract doc names round-tripped through forge-ui's migration — not just
+    // project.name (regate-15: a project.name-only check let deleting workstreams/qualityGates/metrics
+    // stay green). Fixture-name sanity: canonical (.forge/state.json) must equal the seeded identity.
+    const expected = {
+      version: GOV_SENTINEL.version,
+      project: GOV_SENTINEL.project,
+      workstreamsCount: GOV_SENTINEL.workstreams.length,
+      qualityGates: GOV_SENTINEL.qualityGates,
+      metrics: GOV_SENTINEL.metrics,
+    };
+    const gcc = checkGovernanceContract(gsc.parsed, expected);
+    check("governance.json contract fully round-trips (version/project{name,vision,goals}/workstreams/qualityGates/metrics, all three live)",
+      gsc.ok && gcc.ok && GOV_SENTINEL.project.name === canonical, gcc.problems.join("; ") || (gsc.ok ? "" : gsc.reason));
+    if (!(gsc.ok && gcc.ok)) {
+      recordFinding("GOVERNANCE_SCHEMA_DIVERGENCE",
+        `forge-ui's migration did not round-trip the full contract (tools.mjs:108-125). Post-boot .claude/governance.json keys=[${Object.keys(afterBoot)}]; failures: ${gcc.problems.join("; ") || gsc.reason}. NOT repaired (a gate must not fix the product). forge-ui owns the round-trip: DIRECTIVE-NXTG-20260719-18. Contract: docs/governance-mcp-governance-json-contract.md.`);
+    }
+
+    const rustHealth = await orchClient.callTool({ name: "forge_get_health", arguments: {} });
+    const rh = checkShapedResponse("forge_get_health", rustHealth, ["drift", "findings", "health_score", "summary"]);
+    check("orchestrator forge_get_health → shaped non-error", rh.ok, rh.reason);
+    const rustScore = rh.parsed?.health_score;
+
+    // ── Leg B: cross-product contract — UI health == round(orchestrator health), identity binds ──
+    console.log("\n[Leg B] contract: data.health.score == Math.round(rust health_score); identity binds");
+    const status1 = await uiStatus(ui.base);
+    const contract = checkHealthContract(status1.health?.score, status1.health?.source, rustScore);
+    check(`UI health == Math.round(orchestrator health_score ${rustScore})`, contract.ok, contract.reason);
+    if (!contract.ok) recordFinding("UI_HEALTH_CONTRACT_DRIFT", contract.reason);
+
+    const ident = checkUiIdentity(status1.project?.name, status1.project?.path, canonical, fixture);
+    check(`forge-ui binds canonical identity (data.project.name == ${canonical}, path == fixture)`, ident.ok, ident.reason);
+    if (!ident.ok) recordFinding("UI_IDENTITY_DRIFT", ident.reason);
+
+    // -16 watch: cross-product shared-store contamination shows as inconsistent health across polls.
+    const status2 = await uiStatus(ui.base);
+    const consistent = status1.health?.score === status2.health?.score && status1.project?.path === status2.project?.path;
+    check("health/identity consistent across polls (no ~/.forge cross-store contamination)", consistent,
+      consistent ? "" : `poll1=${status1.health?.score}@${status1.project?.path} poll2=${status2.health?.score}@${status2.project?.path}`);
+    if (!consistent) recordFinding("CROSS_STORE_CONTAMINATION", `DIRECTIVE-16 class: poll1 score=${status1.health?.score} poll2 score=${status2.health?.score} (record, do not chase)`);
+
+    // ── Leg C: liveness — WS round-trip + MCP→UI reflection (task-scoped) ──
+    console.log("\n[Leg C] liveness: WS state.update+ping/pong; complete T-001 via MCP → UI reflects live");
+    const tokenResp = await uiFetch(ui.base, "/api/auth/ws-token", { method: "POST", headers: { Origin: "http://localhost:5050" } }).then((r) => r.json());
+    const token = tokenResp?.data?.token;
+    check("POST /api/auth/ws-token → token issued", typeof token === "string" && token.length > 0);
+    const rt = await wsRoundtrip(ui.base, token, canonical);
+    const wsc = checkWsRoundtrip({ events: rt.events, fixtureBound: rt.fixtureBound });
+    check(`WS round-trip: state.update (fixture-bound) + ping/pong [events: ${rt.events.join(",")}]`, wsc.ok, wsc.reason);
+
+    // MCP→UI reflection, SCOPED TO T-001 (regate-11 C3 discipline): complete T-001, then the UI's
+    // orchestrator-sourced health must still AGREE with a fresh forge_get_health (live read, not stale).
+    await orchClient.callTool({ name: "forge_claim_task", arguments: { task_id: "T-001", agent: "claude" } });
+    await orchClient.callTool({ name: "forge_complete_task", arguments: { task_id: "T-001", agent: "claude", result_summary: "done by L3 harness" } });
+    const t001Status = JSON.parse(readFileSync(join(fixture, ".forge", "tasks", "T-001.json"), "utf8")).status;
+    check("T-001 completed via MCP (tasks/T-001.json status == completed)", t001Status === "completed", `got ${t001Status}`);
+    const freshRust = JSON.parse(textOf(await orchClient.callTool({ name: "forge_get_health", arguments: {} })))?.health_score;
+    const statusAfter = await uiStatus(ui.base);
+    const reflect = checkHealthContract(statusAfter.health?.score, statusAfter.health?.source, freshRust);
+    check("post-mutation: UI health still == Math.round(fresh orchestrator health) [live read, not stale]", reflect.ok, reflect.reason);
+    if (!reflect.ok) recordFinding("UI_HEALTH_CONTRACT_DRIFT", `post-mutation: ${reflect.reason}`);
+
+    // ── Leg D: the plugin skills' own forge-ui recipes, against v3.4.1 auth (DIRECTIVE-NXTG-20261007-14) ──
+    console.log("\n[Leg D] skill recipes vs forge-ui auth: verify-governance sentinel + browser-debugging health");
+    const secretFile = join(uiHome, "ui-secret-for-skills");
+    writeFileSync(secretFile, uiToken, { mode: 0o600 });
+    const absent = join(uiHome, "no-such-ui-secret");
+    const tokenFree = (out) => !out.includes(uiToken);
+
+    const sentinel = skillSnippet("verify-governance", "# forge-ui sentinel (local-client auth");
+    const sOk = runSnippet(sentinel, { home: uiHome, api: ui.base, secretFile });
+    // forge-ui v3.4.1 keeps sentinelLog in RUNTIME state (.forge/governance-runtime.json), not in the
+    // versioned .claude/governance.json (forge-ui src/services/governance-state-manager.ts:26,60).
+    const runtimePath = join(fixture, ".forge", "governance-runtime.json");
+    const sentinelLog = existsSync(runtimePath) ? (JSON.parse(readFileSync(runtimePath, "utf8")).sentinelLog || []) : [];
+    const logged = sentinelLog.some((e) => e?.source === "verify-governance" && /change JUSTIFIED/.test(e?.message || ""));
+    check("verify-governance sentinel recipe WITH the token → HTTP 200, entry in sentinelLog, token never printed",
+      /sentinel: HTTP 200\b/.test(sOk.out) && logged && tokenFree(sOk.out), `out=${sOk.out.trim()} logged=${logged}`);
+    const sNo = runSnippet(sentinel, { home: uiHome, api: ui.base, secretFile: absent });
+    check("verify-governance sentinel recipe WITHOUT a token → HTTP 401", /sentinel: HTTP 401\b/.test(sNo.out) && tokenFree(sNo.out),
+      `out=${sNo.out.trim()}`);
+
+    const health = skillSnippet("browser-debugging", "# forge-ui health (local-client auth");
+    const hOk = runSnippet(health, { home: uiHome, api: ui.base, secretFile });
+    check("browser-debugging health recipe WITH the token → \"API up\", token never printed",
+      /API up/.test(hOk.out) && tokenFree(hOk.out), `code=${hOk.code} out=${hOk.out.trim()}`);
+    const hNo = runSnippet(health, { home: uiHome, api: ui.base, secretFile: absent });
+    // Exit 22 is curl -f's "HTTP error >= 400": the server answered and refused. A timeout (28) or a
+    // dead server (7) must not pass as a refusal.
+    check("browser-debugging health recipe WITHOUT a token → refused by the server (curl exit 22, no \"API up\")",
+      !/API up/.test(hNo.out) && hNo.code === 22, `code=${hNo.code} out=${hNo.out.trim()}`);
+  } finally {
+    for (const c of [orchClient, govClient]) { try { if (c) await c.close(); } catch { /* */ } }
+    for (const t of [orchTransport, govTransport]) { try { if (t) await t.close(); } catch { /* */ } }
+    await reap(uiChild);
+    if (fixture) rmSync(fixture, { recursive: true, force: true });
+    if (uiHome) rmSync(uiHome, { recursive: true, force: true });
+  }
+  summarize();
+}
+
+function summarize() {
+  if (findings.length) {
+    console.log("\n-- recorded product findings (routed to FPL; not harness bugs) --");
+    for (const f of findings) console.log(`  FINDING ${f}`);
+  }
+  console.log(`\n== L3 harness: ${passed} passed, ${failures.length} failed ==`);
+  if (failures.length) {
+    for (const f of failures) console.log(`  FAIL: ${f}`);
+    process.exitCode = 1;
+  }
+}
+
+const invokedDirectly = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (invokedDirectly) {
+  main().catch((e) => { console.error("L3 harness crashed:", redact(String(e?.stack || e))); process.exitCode = 1; });
+}
+
+export { makeFixtureWith };
